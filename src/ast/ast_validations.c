@@ -737,6 +737,7 @@ static VISITOR_STRATEGY _Validate_projection
 static AST_Validation _ValidateFunctionCall
 (
 	const char *funcName,    // function name
+	uint argc,               // number of arguments passed to the function
 	bool include_aggregates  // are aggregations allowed
 ) {
 	if (_ValidateNameLength (funcName, "Function name") == AST_INVALID) {
@@ -753,6 +754,27 @@ static AST_Validation _ValidateFunctionCall
 		// Provide a unique error for using aggregate functions from inappropriate contexts
 		ErrorCtx_SetError(EMSG_INVALID_USE_OF_AGGREGATION_FUNCTION, funcName);
 		return AST_INVALID;
+	}
+
+	// validate the number of arguments matches the function's expected arity
+	// this mirrors the runtime check performed when constructing the arithmetic
+	// expression, catching the error during AST validation instead so that
+	// plan construction is never reached with a poisoned error state
+	AR_FuncDesc *fdesc = AR_GetFunc(funcName, false);
+	if(fdesc != NULL) {
+		// UDF invocations carry two implicit leading arguments
+		// (library name & function name); account for them so the comparison
+		// matches the registered arity
+		uint effective_argc = fdesc->udf ? argc + 2 : argc;
+		if(fdesc->min_argc > effective_argc) {
+			ErrorCtx_SetError(EMSG_FUNCTION_MIN_ARGS, effective_argc,
+							  fdesc->name, fdesc->min_argc);
+			return AST_INVALID;
+		} else if(fdesc->max_argc < effective_argc) {
+			ErrorCtx_SetError(EMSG_FUNCTION_MAX_ARGS, effective_argc,
+							  fdesc->name, fdesc->max_argc);
+			return AST_INVALID;
+		}
 	}
 
 	return AST_VALID;
@@ -805,8 +827,10 @@ static VISITOR_STRATEGY _Validate_apply_operator
 	// Collect the function name.
 	const cypher_astnode_t *func = cypher_ast_apply_operator_get_func_name(n);
 	const char *func_name = cypher_ast_function_name_get_value(func);
-	if(_ValidateFunctionCall(func_name, (vctx->clause == CYPHER_AST_WITH ||
-										vctx->clause == CYPHER_AST_RETURN)) == AST_INVALID) {
+	uint arg_count = cypher_ast_apply_operator_narguments(n);
+	if(_ValidateFunctionCall(func_name, arg_count,
+							(vctx->clause == CYPHER_AST_WITH ||
+							 vctx->clause == CYPHER_AST_RETURN)) == AST_INVALID) {
 		return VISITOR_BREAK;
 	}
 
@@ -931,6 +955,7 @@ static AST_Validation _ValidateInlinedProperties
 	// traverse map entries
 	uint prop_count = cypher_ast_map_nentries(props);
 	for(uint i = 0; i < prop_count; i++) {
+		const char *key = cypher_ast_prop_name_get_value(cypher_ast_map_get_key(props, i));
 		const cypher_astnode_t *prop_val = cypher_ast_map_get_value(props, i);
 		const cypher_astnode_t **patterns = AST_GetTypedNodes(prop_val, CYPHER_AST_PATTERN_PATH);
 		uint patterns_count = arr_len(patterns);
@@ -940,6 +965,16 @@ static AST_Validation _ValidateInlinedProperties
 			// MATCH (a {prop: ()-[]->()}) RETURN a
 			ErrorCtx_SetError(EMSG_UNHANDLED_TYPE_INLINE_PROPERTIES);
 			return AST_INVALID;
+		}
+
+		// Error if there are duplicate inlined properties
+		uint j = 0;
+		for(; j < i; j++) {
+			const char *prev_key = cypher_ast_prop_name_get_value(cypher_ast_map_get_key(props, j));
+			if(strcmp(key, prev_key) == 0) {
+				ErrorCtx_SetError(EMSG_DUPLICATE_INLINE_PROPERTY, key);
+				return AST_INVALID;
+			}
 		}
 	}
 
@@ -1900,7 +1935,7 @@ static VISITOR_STRATEGY _Validate_CREATE_Clause
 	uint l = arr_len(new_identifiers);
 	for(uint i = 0; i < l; i+=2) {
 		const char *alias = new_identifiers[i];
-		SIType t = (SIType)new_identifiers[i+1];
+		SIType t = (SIType)(intptr_t)new_identifiers[i+1];
 
 		// fail on duplicate identifier
 		if(_IdentifierAdd(vctx, alias, (void*)t) == 0 && t == T_EDGE) {
